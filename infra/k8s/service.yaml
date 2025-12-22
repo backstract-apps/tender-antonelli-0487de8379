@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: tender-antonelli-0487de8379-srv
+spec:
+  selector:
+    app: tender-antonelli-0487de8379
+  ports:
+    - protocol: TCP
+      port: 80
+      targetPort: 7070
+  type: ClusterIP
