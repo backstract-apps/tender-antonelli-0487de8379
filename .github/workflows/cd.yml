@@ -145,9 +145,8 @@ jobs:
           aws eks update-kubeconfig --name "${EKS_CLUSTER}" --region "${AWS_REGION}"
           kubectl cluster-info
 
-      # ✅ FIXED: rollout restart uses the actual deployment name returned by kubectl
-      - name: Deploy to AWS EKS Cluster (apply + wait)
-        timeout-minutes: 12
+      - name: Deploy to AWS EKS Cluster (apply + wait + debug on failure)
+        timeout-minutes: 15
         env:
           BST_TOKEN: ${{ secrets.BACKSTRACT_AUTH_TOKEN }}
         run: |
@@ -163,7 +162,6 @@ jobs:
           kubectl apply -f "${INFRA_DIR}/aws-auth.yaml"
           kubectl apply -f "${INFRA_DIR}/env-configmap.yaml"
       
-          # Inject token into deployment template
           awk -v token="${BST_TOKEN}" '{gsub(/PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME/, token)}1' "${INFRA_DIR}/deployment.yaml" > /tmp/deployment.yaml
       
           if grep -q "PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME" /tmp/deployment.yaml; then
@@ -171,25 +169,63 @@ jobs:
             exit 1
           fi
       
-          # ✅ IMPORTANT: Avoid SIGPIPE by capturing apply output with tee (no head/awk early-exit)
+          # Apply deployment and capture names (safe; no SIGPIPE)
           kubectl apply -f /tmp/deployment.yaml -o name | tee /tmp/applied_names.txt >/dev/null
-      
           echo "Applied resources:"
           cat /tmp/applied_names.txt
       
-          # Extract the first deployment name from the file (safe; kubectl already finished)
           DEPLOYMENT_NAME="$(grep '^deployment\.apps/' /tmp/applied_names.txt | sed -n '1p' | sed 's#deployment\.apps/##')"
-      
           if [ -z "${DEPLOYMENT_NAME}" ]; then
             echo "ERROR: Could not detect deployment name from kubectl output."
             exit 1
           fi
-      
           echo "Detected deployment: ${DEPLOYMENT_NAME}"
       
           kubectl apply -f "${INFRA_DIR}/service.yaml"
       
+          # Restart + wait
           kubectl rollout restart deployment "${DEPLOYMENT_NAME}"
-          kubectl rollout status deployment "${DEPLOYMENT_NAME}" --timeout=300s
       
+          echo "Waiting for rollout..."
+          if ! kubectl rollout status deployment "${DEPLOYMENT_NAME}" --timeout=300s; then
+            echo ""
+            echo "==== ROLLOUT FAILED: DEBUG INFO ===="
+            echo ""
+      
+            echo ">> Deployment describe:"
+            kubectl describe deployment "${DEPLOYMENT_NAME}" || true
+      
+            echo ""
+            echo ">> ReplicaSets:"
+            kubectl get rs -o wide || true
+      
+            echo ""
+            echo ">> Pods for this deployment (by label if present, else show latest pods):"
+            # Try to find pods via deployment selector
+            SELECTOR="$(kubectl get deployment "${DEPLOYMENT_NAME}" -o jsonpath='{range $k,$v := .spec.selector.matchLabels}{printf "%s=%s," $k $v}{end}' | sed 's/,$//')"
+            echo "Selector: ${SELECTOR}"
+            if [ -n "${SELECTOR}" ]; then
+              kubectl get pods -l "${SELECTOR}" -o wide || true
+              echo ""
+              echo ">> Describe pods:"
+              for p in $(kubectl get pods -l "${SELECTOR}" -o jsonpath='{range .items[*]}{.metadata.name}{" "}{end}'); do
+                echo "--- describe pod $p ---"
+                kubectl describe pod "$p" || true
+                echo "--- last 200 log lines (all containers) for $p ---"
+                kubectl logs "$p" --all-containers=true --tail=200 || true
+              done
+            else
+              kubectl get pods -A -o wide | tail -n 50 || true
+            fi
+      
+            echo ""
+            echo ">> Recent events (last 50):"
+            kubectl get events --sort-by=.metadata.creationTimestamp | tail -n 50 || true
+      
+            echo ""
+            echo "Failing workflow because rollout timed out."
+            exit 1
+          fi
+      
+          echo "Rollout successful."
           kubectl get pods -o wide
