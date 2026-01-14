@@ -4,7 +4,6 @@ on:
   push:
     branches: [ master ]
 
-# Prevent parallel deploys to the same branch
 concurrency:
   group: cd-${{ github.ref }}
   cancel-in-progress: true
@@ -13,9 +12,8 @@ jobs:
   deploy:
     name: Build Docker image and Push to AWS ECR and Deploy to EKS
     runs-on: prod-eks-runners
-    timeout-minutes: 30
+    timeout-minutes: 40
 
-    # Common env used by steps (keep these names exactly)
     env:
       AWS_REGION: ap-south-1
       EKS_CLUSTER: backstract-dev
@@ -29,7 +27,6 @@ jobs:
         with:
           fetch-depth: 1
 
-      # Keep this as plain run so it never hangs because of log-streamer networking
       - name: Setup job (debug)
         timeout-minutes: 2
         run: |
@@ -46,6 +43,34 @@ jobs:
           docker info || true
           echo "Job setup completed"
 
+      # ✅ ADD THIS: install AWS CLI v2
+      - name: Install AWS CLI v2
+        timeout-minutes: 5
+        run: |
+          set -euo pipefail
+
+          if command -v aws >/dev/null 2>&1; then
+            echo "AWS CLI already installed: $(aws --version)"
+            exit 0
+          fi
+
+          # Install deps
+          if command -v apt-get >/dev/null 2>&1; then
+            sudo apt-get update -y
+            sudo apt-get install -y unzip curl
+          elif command -v yum >/dev/null 2>&1; then
+            sudo yum install -y unzip curl
+          else
+            echo "ERROR: Neither apt-get nor yum found. Cannot install AWS CLI automatically."
+            exit 1
+          fi
+
+          curl -sSLo /tmp/awscliv2.zip "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip"
+          unzip -q /tmp/awscliv2.zip -d /tmp
+          sudo /tmp/aws/install --update
+
+          aws --version
+
       - name: Install kubectl
         uses: azure/setup-kubectl@v4
         with:
@@ -58,7 +83,6 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      # Sanity check: ensures AWS creds are actually working in this runner pod
       - name: Sanity check AWS identity
         run: |
           set -euo pipefail
@@ -70,10 +94,8 @@ jobs:
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      # ✅ IMPORTANT: this step does NOT rely on steps.login-ecr.outputs.registry
-      # We compute REGISTRY from AWS account ID to avoid the ":" invalid tag issue.
       - name: Build and push to ECR (BuildKit + registry cache)
-        timeout-minutes: 20
+        timeout-minutes: 25
         run: |
           set -euo pipefail
           date
@@ -82,7 +104,6 @@ jobs:
           REGISTRY="${AWS_ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com"
           IMAGE="${REGISTRY}/${ECR_REPO}"
           SHA_TAG="${GITHUB_SHA}"
-          STATIC_TAG="${STATIC_TAG}"
 
           echo "AWS_ACCOUNT_ID=${AWS_ACCOUNT_ID}"
           echo "REGISTRY=${REGISTRY}"
@@ -90,19 +111,7 @@ jobs:
           echo "SHA_TAG=${SHA_TAG}"
           echo "STATIC_TAG=${STATIC_TAG}"
 
-          if [ -z "${AWS_ACCOUNT_ID}" ] || [ -z "${REGISTRY}" ] || [ -z "${IMAGE}" ]; then
-            echo "ERROR: Registry/Image variables are empty. Check AWS credentials/ECR access."
-            exit 1
-          fi
-
-          # Create/use buildx builder
           docker buildx create --use --name builder >/dev/null 2>&1 || docker buildx use builder
-
-          echo "Building and pushing:"
-          echo "  ${IMAGE}:${SHA_TAG}"
-          echo "  ${IMAGE}:${STATIC_TAG}"
-          echo "Using cache ref:"
-          echo "  ${IMAGE}:buildcache"
 
           time docker buildx build \
             --platform linux/amd64 \
@@ -116,15 +125,14 @@ jobs:
           date
 
       - name: Update kubeconfig to point to EKS
-        timeout-minutes: 5
+        timeout-minutes: 8
         run: |
           set -euo pipefail
           aws eks update-kubeconfig --name "${EKS_CLUSTER}" --region "${AWS_REGION}"
-          kubectl version --client=true
           kubectl cluster-info
 
       - name: Deploy to AWS EKS Cluster (apply + wait)
-        timeout-minutes: 8
+        timeout-minutes: 10
         env:
           BST_TOKEN: ${{ secrets.BACKSTRACT_AUTH_TOKEN }}
         run: |
@@ -135,13 +143,11 @@ jobs:
             exit 1
           fi
 
-          # Apply static manifests
           kubectl apply -f "${INFRA_DIR}/alloy-rbac.yaml"
           kubectl apply -f "${INFRA_DIR}/alloy-configmap.yaml"
           kubectl apply -f "${INFRA_DIR}/aws-auth.yaml"
           kubectl apply -f "${INFRA_DIR}/env-configmap.yaml"
 
-          # Inject token into deployment template
           awk -v token="${BST_TOKEN}" '{gsub(/PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME/, token)}1' "${INFRA_DIR}/deployment.yaml" > /tmp/deployment.yaml
 
           if grep -q "PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME" /tmp/deployment.yaml; then
@@ -149,11 +155,9 @@ jobs:
             exit 1
           fi
 
-          # Apply deployment + service
           kubectl apply -f /tmp/deployment.yaml
           kubectl apply -f "${INFRA_DIR}/service.yaml"
 
-          # Restart and wait for rollout (prevents indefinite hang)
           kubectl rollout restart deployment "${STATIC_TAG}-depl"
           kubectl rollout status deployment "${STATIC_TAG}-depl" --timeout=300s
 
