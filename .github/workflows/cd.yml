@@ -152,32 +152,44 @@ jobs:
           BST_TOKEN: ${{ secrets.BACKSTRACT_AUTH_TOKEN }}
         run: |
           set -euo pipefail
-
+      
           if [ -z "${BST_TOKEN:-}" ]; then
             echo "ERROR: BACKSTRACT_AUTH_TOKEN is empty or not set"
             exit 1
           fi
-
+      
           kubectl apply -f "${INFRA_DIR}/alloy-rbac.yaml"
           kubectl apply -f "${INFRA_DIR}/alloy-configmap.yaml"
           kubectl apply -f "${INFRA_DIR}/aws-auth.yaml"
           kubectl apply -f "${INFRA_DIR}/env-configmap.yaml"
-
+      
           # Inject token into deployment template
           awk -v token="${BST_TOKEN}" '{gsub(/PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME/, token)}1' "${INFRA_DIR}/deployment.yaml" > /tmp/deployment.yaml
-
+      
           if grep -q "PLACEHOLDER_BST_TOKEN_REPLACE_AT_RUNTIME" /tmp/deployment.yaml; then
             echo "ERROR: Token injection failed - placeholder still exists"
             exit 1
           fi
-
-          # Apply deployment and capture the real deployment name (works even if name is dynamic)
-          DEPLOYMENT_NAME="$(kubectl apply -f /tmp/deployment.yaml -o name | head -n 1 | sed 's#deployment.apps/##')"
-          echo "Applied deployment: ${DEPLOYMENT_NAME}"
-
+      
+          # ✅ IMPORTANT: Avoid SIGPIPE by capturing apply output with tee (no head/awk early-exit)
+          kubectl apply -f /tmp/deployment.yaml -o name | tee /tmp/applied_names.txt >/dev/null
+      
+          echo "Applied resources:"
+          cat /tmp/applied_names.txt
+      
+          # Extract the first deployment name from the file (safe; kubectl already finished)
+          DEPLOYMENT_NAME="$(grep '^deployment\.apps/' /tmp/applied_names.txt | sed -n '1p' | sed 's#deployment\.apps/##')"
+      
+          if [ -z "${DEPLOYMENT_NAME}" ]; then
+            echo "ERROR: Could not detect deployment name from kubectl output."
+            exit 1
+          fi
+      
+          echo "Detected deployment: ${DEPLOYMENT_NAME}"
+      
           kubectl apply -f "${INFRA_DIR}/service.yaml"
-
+      
           kubectl rollout restart deployment "${DEPLOYMENT_NAME}"
           kubectl rollout status deployment "${DEPLOYMENT_NAME}" --timeout=300s
-
+      
           kubectl get pods -o wide
