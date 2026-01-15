@@ -53,8 +53,6 @@ jobs:
           set -euo pipefail
           aws sts get-caller-identity
 
-
-
       - name: Login to Amazon ECR
         uses: aws-actions/amazon-ecr-login@v2
 
