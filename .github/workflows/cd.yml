@@ -53,11 +53,6 @@ jobs:
           set -euo pipefail
           aws sts get-caller-identity
 
-      - name: Debug OIDC Claims
-        uses: github/actions-oidc-debugger@main
-        with:
-          audience: sts.amazonaws.com
-
 
 
       - name: Login to Amazon ECR
